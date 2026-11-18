@@ -1,0 +1,14 @@
+# Ambiente virtual e caches locais do Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Caches de ferramentas e editores
+.pytest_cache/
+.mplconfig*/
+.vscode/
+.idea/
+
+# Arquivos temporarios do sistema
+Thumbs.db
+.DS_Store
