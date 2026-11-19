@@ -16,20 +16,24 @@ def testar_conversoes():
 def testar_canal_simulado():
     texto = "Mensagem recebida corretamente: acao, fase e modulacao."
     sinal, bits_enviados = psk.criar_audio_da_mensagem(
-        texto, taxa_bits=100, portadora=4_000
+        texto, taxa_bits=100, portadora=4_001
     )
 
-    # Simula atraso entre computadores, atenuacao e ruido do ambiente.
+    # Simula som falso antes da mensagem, diferenca de frequencia entre placas
+    # de som, atraso, atenuacao e ruido do ambiente.
     rng = np.random.default_rng(8)
+    tempo = np.arange(psk.TAXA_AMOSTRAGEM) / psk.TAXA_AMOSTRAGEM
+    interferencia = 0.08 * np.cos(2 * np.pi * 4_000 * tempo)
+    interferencia += rng.normal(0, 0.015, len(interferencia))
     atraso = np.zeros(12_345)
-    recebido = np.concatenate([atraso, 0.45 * sinal])
+    recebido = np.concatenate([interferencia, atraso, 0.45 * sinal])
     recebido += rng.normal(0, 0.008, len(recebido))
 
     recuperado, bits_recebidos, diagnostico = psk.demodular_bpsk(
         recebido, taxa_bits=100, portadora=4_000
     )
     assert recuperado == texto
-    assert diagnostico["metrica_sincronizacao"] > 0.8
+    assert diagnostico["metrica_sincronizacao"] > 0.6
     assert bits_recebidos[:len(bits_enviados)] == bits_enviados
 
 

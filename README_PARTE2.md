@@ -52,7 +52,7 @@ Copie o projeto para os dois computadores. Ambos devem usar a configuração pad
 
 1. Execute `parte2_psk.py`.
 2. Escolha `2 - RECEPTOR`.
-3. Use inicialmente 12 segundos de gravação.
+3. Use inicialmente 15 segundos de gravação.
 4. Pressione Enter para começar a gravar.
 
 ### Computador emissor
@@ -64,7 +64,7 @@ Copie o projeto para os dois computadores. Ambos devem usar a configuração pad
 
 Quando a gravação terminar, o receptor deve mostrar `MENSAGEM RECEBIDA` e a frase original.
 
-Comece com os computadores separados por aproximadamente 30 a 60 centímetros, volume entre 50% e 70% e ambiente silencioso. Volume máximo pode provocar distorção.
+Comece com os computadores separados por aproximadamente 10 a 30 centímetros, volume entre 40% e 60% e ambiente silencioso. Volume máximo pode provocar distorção.
 
 ## 5. Gráficos pedidos
 
@@ -110,6 +110,11 @@ preambulo | marcador | tamanho | texto | checksum
 - o tamanho informa quantos bytes devem ser lidos;
 - o checksum detecta bits incorretos.
 
+Os bits de tamanho, texto e checksum são transmitidos três vezes. O receptor
+escolhe o valor majoritário de cada grupo, corrigindo um erro em cada trio.
+Antes da decisão, ele filtra a região da portadora, procura o preâmbulo na
+gravação inteira e compensa pequenas diferenças entre as placas de som.
+
 ### BPSK
 
 Cada bit controla a fase da portadora:
@@ -133,7 +138,7 @@ resultado negativo -> bit 0
 ## 8. Diagnóstico de problemas
 
 - `Nenhum sinal PSK detectado`: aumente moderadamente o volume ou aproxime os computadores.
-- `Sincronização fraca`: reduza ruídos e confirme que os dois lados usam a mesma portadora e taxa.
+- `Sincronização fraca`: a busca já percorre a gravação inteira; confirme o microfone e se os dois lados usam a mesma portadora e taxa.
 - `Checksum incorreto`: houve erro em um ou mais bits; diminua a distância ou o volume se estiver distorcendo.
 - `Gravação terminou antes do final`: aumente o tempo de gravação.
 - mensagem errada em caracteres acentuados: confirme que o checksum passou; UTF-8 já é suportado.
@@ -141,7 +146,7 @@ resultado negativo -> bit 0
 ## 9. Roteiro para apresentação
 
 1. Mostre a configuração padrão: 100 bits/s e 4 kHz.
-2. No receptor, inicie uma gravação de 12 segundos.
+2. No receptor, inicie uma gravação de 15 segundos.
 3. No emissor, digite uma frase e pressione Enter.
 4. Mostre a frase aparecendo no receptor.
 5. Abra as FFTs emitida e recebida com a opção `7`.

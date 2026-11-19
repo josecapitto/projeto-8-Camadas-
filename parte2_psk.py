@@ -28,10 +28,17 @@ SILENCIO_INICIAL = 0.8          # ajuda o receptor a encontrar o inicio
 SILENCIO_FINAL = 0.5
 
 # Alternancia conhecida usada pelo receptor para descobrir inicio e fase.
-PREAMBULO = [1, 0] * 16
+# Um preambulo maior torna a busca mais segura em gravacoes com ruido.
+PREAMBULO = [1, 0] * 32
 
 # Palavra conhecida que confirma que o quadro realmente comecou ali.
-MARCADOR = [int(bit) for bit in f"{0xDDAA:016b}"]
+MARCADOR = [int(bit) for bit in f"{0xDDAA96B5:032b}"]
+
+# Cada bit de cabecalho, texto e checksum e enviado tres vezes. O receptor
+# decide por maioria. A portadora continua mudando a 100 bits/s; apenas a taxa
+# de informacao util fica menor em troca de maior resistencia a erros.
+REPETICOES = 3
+MAXIMO_BYTES = 512
 
 PASTA_RESULTADOS = Path("parte2/resultados")
 PASTA_GRAFICOS = Path("parte2/graficos")
@@ -86,47 +93,82 @@ def bits_para_bytes(bits):
     )
 
 
+def codificar_repeticao(bits):
+    """Repete cada bit para permitir decisao por maioria no receptor."""
+    return [bit for bit in bits for _ in range(REPETICOES)]
+
+
+def decodificar_repeticao(bits):
+    """Recupera um bit a cada grupo, escolhendo o valor majoritario."""
+    quantidade = len(bits) // REPETICOES
+    resultado = []
+    for i in range(quantidade):
+        grupo = bits[i * REPETICOES:(i + 1) * REPETICOES]
+        resultado.append(1 if sum(grupo) > REPETICOES // 2 else 0)
+    return resultado
+
+
 def montar_quadro(texto):
-    """Monta: preambulo + marcador + tamanho + texto UTF-8 + checksum."""
+    """Monta o quadro BPSK com redundancia nos campos de dados."""
     dados = texto.encode("utf-8")
     if not dados:
         raise ValueError("Digite uma mensagem antes de transmitir.")
-    if len(dados) > 65_535:
-        raise ValueError("A mensagem e grande demais.")
+    if len(dados) > MAXIMO_BYTES:
+        raise ValueError(f"Use no maximo {MAXIMO_BYTES} bytes por mensagem.")
 
     tamanho = inteiro_para_bits(len(dados), 16)
     conteudo = bytes_para_bits(dados)
     checksum = inteiro_para_bits(sum(dados) % 256, 8)
-    return PREAMBULO + MARCADOR + tamanho + conteudo + checksum
+    protegidos = codificar_repeticao(tamanho + conteudo + checksum)
+    return PREAMBULO + MARCADOR + protegidos
 
 
 def interpretar_quadro(bits):
-    """Valida marcador, tamanho e checksum; depois reconstrói o texto."""
+    """Remove a redundancia, valida o quadro e reconstrói o texto."""
     inicio_marcador = len(PREAMBULO)
     fim_marcador = inicio_marcador + len(MARCADOR)
-    if bits[inicio_marcador:fim_marcador] != MARCADOR:
+    marcador_recebido = bits[inicio_marcador:fim_marcador]
+    erros_marcador = sum(
+        recebido != esperado
+        for recebido, esperado in zip(marcador_recebido, MARCADOR)
+    )
+    if len(marcador_recebido) != len(MARCADOR) or erros_marcador > 3:
         raise ValueError(
             "Marcador nao encontrado. A gravacao pode estar baixa, ruidosa "
             "ou com a portadora incorreta."
         )
 
-    inicio_tamanho = fim_marcador
-    fim_tamanho = inicio_tamanho + 16
-    if len(bits) < fim_tamanho:
+    bits_protegidos = bits[fim_marcador:]
+    tamanho_protegido = 16 * REPETICOES
+    if len(bits_protegidos) < tamanho_protegido:
         raise ValueError("A gravacao terminou antes do cabecalho.")
-    quantidade_bytes = bits_para_inteiro(bits[inicio_tamanho:fim_tamanho])
 
-    inicio_texto = fim_tamanho
-    fim_texto = inicio_texto + quantidade_bytes * 8
-    fim_checksum = fim_texto + 8
-    if len(bits) < fim_checksum:
+    cabecalho = decodificar_repeticao(
+        bits_protegidos[:tamanho_protegido]
+    )
+    quantidade_bytes = bits_para_inteiro(cabecalho[:16])
+    if quantidade_bytes > MAXIMO_BYTES:
+        raise ValueError(
+            "Cabecalho corrompido: o tamanho recebido nao e valido. "
+            "Reduza o ruido ou aproxime os computadores."
+        )
+
+    quantidade_logica = 16 + quantidade_bytes * 8 + 8
+    quantidade_fisica = quantidade_logica * REPETICOES
+    if len(bits_protegidos) < quantidade_fisica:
         raise ValueError(
             "A gravacao terminou antes do final da mensagem. "
             "Aumente o tempo de gravacao do receptor."
         )
 
-    dados = bits_para_bytes(bits[inicio_texto:fim_texto])
-    checksum_recebido = bits_para_inteiro(bits[fim_texto:fim_checksum])
+    logicos = decodificar_repeticao(
+        bits_protegidos[:quantidade_fisica]
+    )
+    inicio_texto = 16
+    fim_texto = inicio_texto + quantidade_bytes * 8
+    fim_checksum = fim_texto + 8
+    dados = bits_para_bytes(logicos[inicio_texto:fim_texto])
+    checksum_recebido = bits_para_inteiro(logicos[fim_texto:fim_checksum])
     checksum_calculado = sum(dados) % 256
     if checksum_recebido != checksum_calculado:
         raise ValueError(
@@ -135,7 +177,8 @@ def interpretar_quadro(bits):
         )
 
     try:
-        return dados.decode("utf-8"), fim_checksum
+        usados = fim_marcador + quantidade_fisica
+        return dados.decode("utf-8"), usados
     except UnicodeDecodeError as erro:
         raise ValueError("Os bytes recebidos nao formam um texto UTF-8.") from erro
 
@@ -202,6 +245,28 @@ def estimar_inicio(sinal, amostras_por_bit):
     return int(encontrados[0])
 
 
+def filtrar_em_torno_da_portadora(sinal, taxa_bits, portadora):
+    """Remove sons distantes da portadora antes da sincronizacao.
+
+    O filtro e aplicado no dominio da frequencia porque o receptor trabalha
+    com a gravacao completa. A transicao suave evita um corte muito abrupto.
+    """
+    sinal = np.asarray(sinal, dtype=np.float64)
+    frequencias = np.fft.rfftfreq(len(sinal), 1 / TAXA_AMOSTRAGEM)
+    espectro = np.fft.rfft(sinal)
+    distancia = np.abs(frequencias - portadora)
+    largura = max(600.0, 4.0 * taxa_bits)
+    transicao = 250.0
+
+    mascara = np.zeros_like(frequencias)
+    mascara[distancia <= largura] = 1.0
+    zona = (distancia > largura) & (distancia < largura + transicao)
+    mascara[zona] = 0.5 * (
+        1 + np.cos(np.pi * (distancia[zona] - largura) / transicao)
+    )
+    return np.fft.irfft(espectro * mascara, n=len(sinal))
+
+
 def integra_simbolos(acumulada_complexa, inicio, quantidade, amostras_por_bit):
     """Integra cada intervalo de bit depois da mistura com a portadora local."""
     comecos = inicio + np.arange(quantidade) * amostras_por_bit
@@ -212,15 +277,17 @@ def integra_simbolos(acumulada_complexa, inicio, quantidade, amostras_por_bit):
 
 
 def sincronizar(sinal, taxa_bits, portadora):
-    """Encontra o primeiro bit e estima a fase desconhecida do canal acustico."""
+    """Busca o preambulo na gravacao inteira e estima fase e deriva."""
     validar_parametros(taxa_bits, portadora)
     amostras_por_bit = TAXA_AMOSTRAGEM // taxa_bits
-    inicio_aproximado = estimar_inicio(sinal, amostras_por_bit)
+    sinal_filtrado = filtrar_em_torno_da_portadora(
+        sinal, taxa_bits, portadora
+    )
 
-    n = np.arange(len(sinal))
+    n = np.arange(len(sinal_filtrado))
     oscilador_complexo = np.exp(-2j * np.pi * portadora * n /
                                 TAXA_AMOSTRAGEM)
-    misturado = np.asarray(sinal) * oscilador_complexo
+    misturado = sinal_filtrado * oscilador_complexo
     acumulada = np.concatenate([[0j], np.cumsum(misturado)])
 
     conhecidos = np.asarray(
@@ -228,46 +295,106 @@ def sincronizar(sinal, taxa_bits, portadora):
     )
     quantidade_conhecida = len(conhecidos)
 
-    primeiro = max(0, inicio_aproximado - 2 * amostras_por_bit)
-    ultimo = min(
-        inicio_aproximado + 2 * amostras_por_bit,
-        len(sinal) - quantidade_conhecida * amostras_por_bit - 1,
-    )
-    if ultimo <= primeiro:
+    ultimo = len(sinal_filtrado) - quantidade_conhecida * amostras_por_bit - 1
+    if ultimo <= 0:
         raise ValueError("Nao ha amostras suficientes para sincronizar.")
 
-    melhor_inicio = None
-    melhor_correlacao = None
-    melhor_metrica = -1.0
-
-    # Testa cada possivel deslocamento de uma amostra. A melhor posicao e a
-    # que mais se parece com o preambulo e o marcador que ja conhecemos.
-    for candidato in range(primeiro, ultimo + 1):
+    def avaliar(candidato):
         simbolos = integra_simbolos(
             acumulada, candidato, quantidade_conhecida, amostras_por_bit
         )
         if simbolos is None:
-            continue
-        correlacao = np.sum(simbolos * conhecidos)
-        metrica = np.abs(correlacao) / (np.sum(np.abs(simbolos)) + 1e-15)
+            return None
+        produtos = simbolos * conhecidos
+
+        # Soma a correlacao em blocos curtos e depois combina os modulos. Isso
+        # tolera uma lenta rotacao de fase, mas rejeita um tom continuo: no tom
+        # sem dados, os sinais +1/-1 conhecidos se cancelam dentro dos blocos.
+        tamanho_bloco = 8
+        somas = [
+            np.sum(produtos[i:i + tamanho_bloco])
+            for i in range(0, quantidade_conhecida, tamanho_bloco)
+        ]
+        metrica = np.sum(np.abs(somas)) / (
+            np.sum(np.abs(simbolos)) + 1e-15
+        )
+        correlacao = np.sum(produtos)
+        energia = float(np.mean(np.abs(simbolos)))
+        return float(metrica), energia, correlacao
+
+    # Busca grosseira em toda a gravacao. Isso evita que um clique ou uma voz
+    # antes da mensagem seja confundido com o inicio do quadro.
+    passo = max(1, amostras_por_bit // 8)
+    candidatos = []
+    for candidato in range(0, ultimo + 1, passo):
+        avaliacao = avaliar(candidato)
+        if avaliacao is not None:
+            metrica, energia, correlacao = avaliacao
+            candidatos.append((candidato, metrica, energia, correlacao))
+
+    if not candidatos:
+        raise ValueError("Nao foi possivel procurar o preambulo.")
+
+    maior_energia = max(item[2] for item in candidatos) + 1e-15
+    candidatos = [
+        item for item in candidatos
+        if item[2] >= 0.05 * maior_energia
+    ]
+
+    def pontuacao(item):
+        return item[1] * np.sqrt(item[2] / maior_energia)
+
+    grosseiro = max(candidatos, key=pontuacao)
+
+    # Refina amostra por amostra ao redor do melhor ponto grosseiro.
+    refinados = []
+    primeiro = max(0, grosseiro[0] - passo)
+    final = min(ultimo, grosseiro[0] + passo)
+    for candidato in range(primeiro, final + 1):
+        avaliacao = avaliar(candidato)
+        if avaliacao is not None:
+            metrica, energia, correlacao = avaliacao
+            refinados.append((candidato, metrica, energia, correlacao))
+
+    melhor_inicio, _, _, _ = max(refinados, key=pontuacao)
+    simbolos_conhecidos = integra_simbolos(
+        acumulada, melhor_inicio, quantidade_conhecida, amostras_por_bit
+    )
+
+    # Procura uma pequena rotacao de fase por simbolo. Ela representa a
+    # diferenca entre os relogios das duas placas de som.
+    indices = np.arange(quantidade_conhecida)
+    melhor_metrica = -1.0
+    melhor_correlacao = None
+    melhor_deriva = 0.0
+    for deriva in np.linspace(-0.20, 0.20, 161):
+        compensacao = np.exp(-1j * deriva * indices)
+        correlacao = np.sum(
+            simbolos_conhecidos * conhecidos * compensacao
+        )
+        metrica = np.abs(correlacao) / (
+            np.sum(np.abs(simbolos_conhecidos)) + 1e-15
+        )
         if metrica > melhor_metrica:
             melhor_metrica = float(metrica)
-            melhor_inicio = candidato
             melhor_correlacao = correlacao
+            melhor_deriva = float(deriva)
 
-    if melhor_inicio is None or melhor_metrica < 0.45:
+    if melhor_metrica < 0.28:
         raise ValueError(
-            "Sincronizacao fraca. Aproxime os computadores e aumente "
-            "moderadamente o volume."
+            "Sincronizacao fraca mesmo apos procurar toda a gravacao. "
+            "Confirme o microfone, a taxa e a portadora."
         )
 
     fase = float(np.angle(melhor_correlacao))
-    return melhor_inicio, fase, melhor_metrica, acumulada
+    return (
+        melhor_inicio, fase, melhor_deriva, melhor_metrica, acumulada
+    )
 
 
 def demodular_bpsk(sinal, taxa_bits, portadora):
     """Recupera a mensagem usando uma portadora local e decisao pelo sinal."""
-    inicio, fase, metrica, acumulada = sincronizar(
+    inicio, fase, deriva, metrica, acumulada = sincronizar(
         sinal, taxa_bits, portadora
     )
     amostras_por_bit = TAXA_AMOSTRAGEM // taxa_bits
@@ -278,14 +405,16 @@ def demodular_bpsk(sinal, taxa_bits, portadora):
     if simbolos is None:
         raise ValueError("Falha ao dividir a gravacao em bits.")
 
-    # A fase estimada pelo preambulo desfaz o atraso do alto-falante/microfone.
-    corrigidos = simbolos * np.exp(-1j * fase)
+    # Corrige tanto a fase inicial quanto sua lenta variacao ao longo do audio.
+    fases = fase + deriva * np.arange(len(simbolos))
+    corrigidos = simbolos * np.exp(-1j * fases)
     bits = (np.real(corrigidos) >= 0).astype(int).tolist()
     texto, bits_utilizados = interpretar_quadro(bits)
 
     diagnostico = {
         "inicio_amostra": inicio,
         "fase_graus": np.degrees(fase),
+        "deriva_hz": deriva * taxa_bits / (2 * np.pi),
         "metrica_sincronizacao": metrica,
         "bits_decodificados": bits_utilizados,
     }
@@ -511,8 +640,8 @@ def transmitir(taxa_bits, portadora):
 
 
 def receber(taxa_bits, portadora):
-    entrada = input("Tempo de gravacao em segundos [12]: ").strip()
-    duracao = float(entrada) if entrada else 12.0
+    entrada = input("Tempo de gravacao em segundos [15]: ").strip()
+    duracao = float(entrada) if entrada else 15.0
     if duracao <= 1:
         raise ValueError("Use uma gravacao maior que 1 segundo.")
 
@@ -536,6 +665,10 @@ def receber(taxa_bits, portadora):
     print("\n--- DIAGNOSTICO DO RECEPTOR ---")
     print(f"Inicio detectado na amostra: {diagnostico['inicio_amostra']}")
     print(f"Fase estimada: {diagnostico['fase_graus']:.2f} graus")
+    print(
+        "Diferenca estimada de frequencia: "
+        f"{diagnostico['deriva_hz']:.3f} Hz"
+    )
     print(
         "Qualidade da sincronizacao: "
         f"{diagnostico['metrica_sincronizacao']:.3f}"
