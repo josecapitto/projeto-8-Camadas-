@@ -6,13 +6,39 @@ apresentacao, devem ser usadas as gravacoes reais feitas pelo menu principal.
 
 from pathlib import Path
 import tempfile
+import wave
 
 import numpy as np
 
 import main
 
 
+def testar_reamostragem():
+    """Confere tempo, tom e antialiasing na leitura dos WAVs antigos."""
+    tempo = np.arange(48_000) / 48_000
+    desejado = 0.6 * np.sin(2 * np.pi * 1_000 * tempo)
+    acima_nyquist = 0.3 * np.sin(2 * np.pi * 23_000 * tempo)
+    with tempfile.TemporaryDirectory() as pasta:
+        caminho = Path(pasta) / "antigo_48000.wav"
+        pcm = ((desejado + acima_nyquist) * 32767).astype(np.int16)
+        with wave.open(str(caminho), "wb") as arquivo:
+            arquivo.setnchannels(2)
+            arquivo.setsampwidth(2)
+            arquivo.setframerate(48_000)
+            arquivo.writeframes(np.column_stack([pcm, pcm]).tobytes())
+        convertido = main.carregar_wav(caminho)
+        assert len(convertido) == 44_100
+        referencia = 0.6 * np.sin(2 * np.pi * 1_000 * np.arange(44_100) / 44_100)
+        assert np.max(abs(convertido - referencia)) < 1e-4
+        # O original permanece intacto; a conversao ocorre nas amostras.
+        with wave.open(str(caminho), "rb") as arquivo:
+            assert arquivo.getframerate() == 48_000
+
+
 def executar_teste():
+    assert main.TAXA_AMOSTRAGEM == 44_100
+    testar_reamostragem()
+    print("Reamostragem 48000 -> 44100 Hz: duracao e tom preservados, sem aliasing")
     duracao = 2
     tempo = np.arange(duracao * main.TAXA_AMOSTRAGEM) / main.TAXA_AMOSTRAGEM
 
@@ -66,6 +92,8 @@ def executar_teste():
     with tempfile.TemporaryDirectory() as pasta:
         caminho = Path(pasta) / "teste.wav"
         main.salvar_wav(caminho, tons[0])
+        with wave.open(str(caminho), "rb") as arquivo:
+            assert arquivo.getframerate() == 44_100
         recarregado = main.carregar_wav(caminho)
         assert len(recarregado) == len(tons[0])
 

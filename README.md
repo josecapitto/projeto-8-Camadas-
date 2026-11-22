@@ -44,6 +44,16 @@ Use as opções do menu nesta ordem:
 
 Use fones de ouvido durante os testes. Os sinais modulados ficam em frequências altas e podem ser desagradáveis quando reproduzidos.
 
+A parte AM grava, processa e salva os novos resultados em **44.100 Hz**. Os
+WAVs antigos de 48.000 Hz são reamostrados ao serem lidos: a conversão mantém
+a duração e a frequência da voz e remove componentes acima do novo limite
+de Nyquist. Os arquivos originais permanecem preservados. Não basta trocar
+apenas a taxa escrita no cabeçalho de um WAV.
+
+O arquivo de dados dos gráficos registra a taxa de amostragem. Se a opção `4`
+encontrar um processamento antigo sem essa informação, ela refaz os cálculos
+usando 44.100 Hz antes de mostrar os gráficos.
+
 ## 3. Ideia do projeto
 
 As faixas e suas portadoras são:

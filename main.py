@@ -20,7 +20,7 @@ import numpy as np
 # 1. Parametros do projeto
 # ---------------------------------------------------------------------------
 
-TAXA_AMOSTRAGEM = 48_000
+TAXA_AMOSTRAGEM = 44_100
 DURACAO_GRAVACAO = 5  # segundos
 
 # Cada tupla contem: limite inferior, limite superior e portadora.
@@ -77,6 +77,32 @@ def salvar_wav(caminho, sinal):
         arquivo.writeframes(sinal_16_bits.tobytes())
 
 
+def reamostrar(sinal, taxa_origem, taxa_destino=TAXA_AMOSTRAGEM):
+    """Converte a taxa por FFT, preservando duracao e removendo aliasing.
+
+    Reduzir a taxa corta as frequencias acima do novo limite de Nyquist.
+    Isso permite aproveitar os WAVs antigos de 48 kHz sem alterar seu tom
+    ou apenas trocar o cabecalho do arquivo.
+    """
+    sinal = np.asarray(sinal, dtype=np.float64)
+    if taxa_origem <= 0 or taxa_destino <= 0:
+        raise ValueError("As taxas de amostragem precisam ser positivas.")
+    if not len(sinal) or taxa_origem == taxa_destino:
+        return sinal.copy()
+    tamanho = max(1, round(len(sinal) * taxa_destino / taxa_origem))
+    espectro = np.fft.rfft(sinal)
+    novo = np.zeros(tamanho // 2 + 1, dtype=complex)
+    comum = min(len(sinal), tamanho)
+    novo[:comum // 2 + 1] = espectro[:comum // 2 + 1]
+    if comum % 2 == 0:
+        # O bin de Nyquist representa duas frequencias ao mudar o tamanho.
+        if tamanho < len(sinal):
+            novo[comum // 2] *= 2
+        elif len(sinal) < tamanho:
+            novo[comum // 2] *= 0.5
+    return np.fft.irfft(novo, n=tamanho) * tamanho / len(sinal)
+
+
 def carregar_wav(caminho):
     """Le um WAV PCM de 16 bits e devolve amostras entre -1 e 1."""
     caminho = Path(caminho)
@@ -91,10 +117,6 @@ def carregar_wav(caminho):
 
     if largura != 2:
         raise ValueError(f"{caminho} precisa ser um WAV PCM de 16 bits.")
-    if taxa != TAXA_AMOSTRAGEM:
-        raise ValueError(
-            f"{caminho} esta em {taxa} Hz; use {TAXA_AMOSTRAGEM} Hz."
-        )
 
     sinal = np.frombuffer(quadros, dtype=np.int16).astype(np.float64) / 32768.0
 
@@ -102,7 +124,7 @@ def carregar_wav(caminho):
     if canais > 1:
         sinal = sinal.reshape(-1, canais).mean(axis=1)
 
-    return sinal
+    return reamostrar(sinal, taxa)
 
 
 def obter_sounddevice():
@@ -307,6 +329,7 @@ def processar_projeto(mostrar_graficos_ao_final=True):
     # Guardamos os vetores para reabrir os graficos sem refazer os calculos.
     np.savez_compressed(
         ARQUIVO_DADOS,
+        taxa_amostragem=TAXA_AMOSTRAGEM,
         modulados=np.asarray(modulados),
         meio_fisico=meio_fisico,
         extraidos=np.asarray(extraidos),
@@ -352,7 +375,7 @@ def calcular_fft_db(sinal):
 def configurar_eixo_fft(eixo, titulo, faixa=None):
     """Aplica a mesma aparencia a todos os graficos de espectro."""
     eixo.set_title(titulo)
-    eixo.set_xlim(0, 22_050)
+    eixo.set_xlim(0, TAXA_AMOSTRAGEM / 2)
     eixo.set_ylim(-100, 5)
     eixo.set_xlabel("Frequencia (Hz)")
     eixo.set_ylabel("Magnitude (dB)")
@@ -415,13 +438,12 @@ def mostrar_graficos_salvos():
         raise FileNotFoundError(
             "Ainda nao ha resultados. Use primeiro a opcao de processar."
         )
-    dados = np.load(ARQUIVO_DADOS)
-    gerar_graficos(
-        dados["modulados"],
-        dados["meio_fisico"],
-        dados["extraidos"],
-        mostrar=True,
-    )
+    with np.load(ARQUIVO_DADOS) as dados:
+        if "taxa_amostragem" in dados and int(dados["taxa_amostragem"]) == TAXA_AMOSTRAGEM:
+            gerar_graficos(dados["modulados"], dados["meio_fisico"], dados["extraidos"], mostrar=True)
+            return
+    print("Atualizando os resultados antigos para 44100 Hz...")
+    processar_projeto(mostrar_graficos_ao_final=True)
 
 
 # ---------------------------------------------------------------------------

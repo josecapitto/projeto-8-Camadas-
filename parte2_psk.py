@@ -11,6 +11,9 @@ uma soma de verificacao simples.
 """
 
 from pathlib import Path
+from datetime import datetime
+import argparse
+import json
 import wave
 
 import numpy as np
@@ -21,24 +24,32 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 TAXA_AMOSTRAGEM = 48_000
-TAXA_BITS_PADRAO = 100          # requisito do enunciado: 100 bits/s
+TAXA_BITS_PADRAO = 100          # bits UTEIS/s dos caracteres, antes da repeticao
 PORTADORA_PADRAO = 4_000        # deve ficar entre 2 kHz e 6 kHz
 AMPLITUDE = 0.75
 SILENCIO_INICIAL = 0.8          # ajuda o receptor a encontrar o inicio
 SILENCIO_FINAL = 0.5
 
 # Alternancia conhecida usada pelo receptor para descobrir inicio e fase.
-# Um preambulo maior torna a busca mais segura em gravacoes com ruido.
-PREAMBULO = [1, 0] * 32
+# Triplicamos a sequencia conhecida junto com a velocidade fisica: em
+# 300 bits/s, o treinamento continua durando 0,96 s como na versao anterior.
+PREAMBULO = [1, 0] * 96
 
 # Palavra conhecida que confirma que o quadro realmente comecou ali.
-MARCADOR = [int(bit) for bit in f"{0xDDAA96B5:032b}"]
+MARCADOR = [int(bit) for bit in f"{0xDDAA96B56E2B4C93A7F019D6:096b}"]
 
 # Cada bit de cabecalho, texto e checksum e enviado tres vezes. O receptor
-# decide por maioria. A portadora continua mudando a 100 bits/s; apenas a taxa
-# de informacao util fica menor em troca de maior resistencia a erros.
+# decide por maioria. Para 100 bits uteis/s, o modulador envia 300 bits/s.
+# Cabecalho, treinamento e silencios sao acrescimos ao tempo dos caracteres.
 REPETICOES = 3
 MAXIMO_BYTES = 512
+
+# Compatibilidade com o quadro repetido anterior (a gravacao da sala) e com
+# a primeira versao, sem repeticao. Nunca alteramos esses WAVs para decodificar.
+PREAMBULO_ANTERIOR = [1, 0] * 32
+MARCADOR_ANTERIOR = [int(bit) for bit in f"{0xDDAA96B5:032b}"]
+PREAMBULO_ANTIGO = [1, 0] * 16
+MARCADOR_ANTIGO = [int(bit) for bit in f"{0xDDAA:016b}"]
 
 PASTA_RESULTADOS = Path("parte2/resultados")
 PASTA_GRAFICOS = Path("parte2/graficos")
@@ -51,16 +62,25 @@ def preparar_pastas():
     PASTA_GRAFICOS.mkdir(parents=True, exist_ok=True)
 
 
-def validar_parametros(taxa_bits, portadora):
+def calcular_taxa_fisica(taxa_util):
+    """Cada bit util ocupa tres simbolos BPSK por causa da repeticao."""
+    return taxa_util * REPETICOES
+
+
+def validar_taxa_fisica(taxa_bits, portadora):
     if taxa_bits <= 0:
         raise ValueError("A taxa de bits precisa ser positiva.")
     if not 2_000 <= portadora <= 6_000:
         raise ValueError("A portadora precisa estar entre 2000 e 6000 Hz.")
     if TAXA_AMOSTRAGEM % taxa_bits != 0:
         raise ValueError(
-            f"Escolha uma taxa que divida {TAXA_AMOSTRAGEM}. "
-            "Exemplos: 50, 100, 200 ou 400 bits/s."
+            f"A taxa fisica precisa dividir {TAXA_AMOSTRAGEM}. "
+            "Use, por exemplo, 50, 100, 200 ou 400 bits uteis/s."
         )
+
+
+def validar_parametros(taxa_util, portadora):
+    validar_taxa_fisica(calcular_taxa_fisica(taxa_util), portadora)
 
 
 # ---------------------------------------------------------------------------
@@ -98,13 +118,13 @@ def codificar_repeticao(bits):
     return [bit for bit in bits for _ in range(REPETICOES)]
 
 
-def decodificar_repeticao(bits):
+def decodificar_repeticao(bits, repeticoes=REPETICOES):
     """Recupera um bit a cada grupo, escolhendo o valor majoritario."""
-    quantidade = len(bits) // REPETICOES
+    quantidade = len(bits) // repeticoes
     resultado = []
     for i in range(quantidade):
-        grupo = bits[i * REPETICOES:(i + 1) * REPETICOES]
-        resultado.append(1 if sum(grupo) > REPETICOES // 2 else 0)
+        grupo = bits[i * repeticoes:(i + 1) * repeticoes]
+        resultado.append(1 if sum(grupo) > repeticoes // 2 else 0)
     return resultado
 
 
@@ -123,38 +143,50 @@ def montar_quadro(texto):
     return PREAMBULO + MARCADOR + protegidos
 
 
-def interpretar_quadro(bits):
+def parametros_quadro(formato):
+    if formato == "atual":
+        return PREAMBULO, MARCADOR, REPETICOES
+    if formato == "anterior":
+        return PREAMBULO_ANTERIOR, MARCADOR_ANTERIOR, REPETICOES
+    if formato == "antigo":
+        return PREAMBULO_ANTIGO, MARCADOR_ANTIGO, 1
+    raise ValueError(f"Formato de quadro desconhecido: {formato}")
+
+
+def interpretar_quadro(bits, formato="atual"):
     """Remove a redundancia, valida o quadro e reconstrói o texto."""
-    inicio_marcador = len(PREAMBULO)
-    fim_marcador = inicio_marcador + len(MARCADOR)
+    preambulo, marcador, repeticoes = parametros_quadro(formato)
+    inicio_marcador = len(preambulo)
+    fim_marcador = inicio_marcador + len(marcador)
     marcador_recebido = bits[inicio_marcador:fim_marcador]
     erros_marcador = sum(
         recebido != esperado
-        for recebido, esperado in zip(marcador_recebido, MARCADOR)
+        for recebido, esperado in zip(marcador_recebido, marcador)
     )
-    if len(marcador_recebido) != len(MARCADOR) or erros_marcador > 3:
+    limite_erros = max(1, len(marcador) * 3 // 32)
+    if len(marcador_recebido) != len(marcador) or erros_marcador > limite_erros:
         raise ValueError(
             "Marcador nao encontrado. A gravacao pode estar baixa, ruidosa "
             "ou com a portadora incorreta."
         )
 
     bits_protegidos = bits[fim_marcador:]
-    tamanho_protegido = 16 * REPETICOES
+    tamanho_protegido = 16 * repeticoes
     if len(bits_protegidos) < tamanho_protegido:
         raise ValueError("A gravacao terminou antes do cabecalho.")
 
     cabecalho = decodificar_repeticao(
-        bits_protegidos[:tamanho_protegido]
+        bits_protegidos[:tamanho_protegido], repeticoes
     )
     quantidade_bytes = bits_para_inteiro(cabecalho[:16])
-    if quantidade_bytes > MAXIMO_BYTES:
+    if not 1 <= quantidade_bytes <= MAXIMO_BYTES:
         raise ValueError(
             "Cabecalho corrompido: o tamanho recebido nao e valido. "
             "Reduza o ruido ou aproxime os computadores."
         )
 
     quantidade_logica = 16 + quantidade_bytes * 8 + 8
-    quantidade_fisica = quantidade_logica * REPETICOES
+    quantidade_fisica = quantidade_logica * repeticoes
     if len(bits_protegidos) < quantidade_fisica:
         raise ValueError(
             "A gravacao terminou antes do final da mensagem. "
@@ -162,7 +194,7 @@ def interpretar_quadro(bits):
         )
 
     logicos = decodificar_repeticao(
-        bits_protegidos[:quantidade_fisica]
+        bits_protegidos[:quantidade_fisica], repeticoes
     )
     inicio_texto = 16
     fim_texto = inicio_texto + quantidade_bytes * 8
@@ -188,8 +220,8 @@ def interpretar_quadro(bits):
 # ---------------------------------------------------------------------------
 
 def modular_bpsk(bits, taxa_bits, portadora):
-    """Converte bits em fases: bit 1 = 0 graus; bit 0 = 180 graus."""
-    validar_parametros(taxa_bits, portadora)
+    """Modula bits FISICOS: bit 1 = 0 graus; bit 0 = 180 graus."""
+    validar_taxa_fisica(taxa_bits, portadora)
     amostras_por_bit = TAXA_AMOSTRAGEM // taxa_bits
 
     # +1 representa fase 0; -1 representa uma inversao de 180 graus.
@@ -209,8 +241,10 @@ def adicionar_silencios(sinal):
 
 
 def criar_audio_da_mensagem(texto, taxa_bits, portadora):
+    """taxa_bits e a taxa UTIL dos caracteres; o audio usa tres vezes isso."""
+    validar_parametros(taxa_bits, portadora)
     bits = montar_quadro(texto)
-    modulado = modular_bpsk(bits, taxa_bits, portadora)
+    modulado = modular_bpsk(bits, calcular_taxa_fisica(taxa_bits), portadora)
     return adicionar_silencios(modulado), bits
 
 
@@ -269,6 +303,8 @@ def filtrar_em_torno_da_portadora(sinal, taxa_bits, portadora):
 
 def integra_simbolos(acumulada_complexa, inicio, quantidade, amostras_por_bit):
     """Integra cada intervalo de bit depois da mistura com a portadora local."""
+    if quantidade <= 0 or inicio < 0:
+        return None
     comecos = inicio + np.arange(quantidade) * amostras_por_bit
     finais = comecos + amostras_por_bit
     if finais[-1] >= len(acumulada_complexa):
@@ -276,10 +312,8 @@ def integra_simbolos(acumulada_complexa, inicio, quantidade, amostras_por_bit):
     return acumulada_complexa[finais] - acumulada_complexa[comecos]
 
 
-def sincronizar(sinal, taxa_bits, portadora):
-    """Busca o preambulo na gravacao inteira e estima fase e deriva."""
-    validar_parametros(taxa_bits, portadora)
-    amostras_por_bit = TAXA_AMOSTRAGEM // taxa_bits
+def preparar_recepcao(sinal, taxa_bits, portadora):
+    """Filtra e mistura uma unica vez, mesmo ao tentar diferentes quadros."""
     sinal_filtrado = filtrar_em_torno_da_portadora(
         sinal, taxa_bits, portadora
     )
@@ -288,137 +322,237 @@ def sincronizar(sinal, taxa_bits, portadora):
     oscilador_complexo = np.exp(-2j * np.pi * portadora * n /
                                 TAXA_AMOSTRAGEM)
     misturado = sinal_filtrado * oscilador_complexo
-    acumulada = np.concatenate([[0j], np.cumsum(misturado)])
+    return np.concatenate([[0j], np.cumsum(misturado)])
 
-    conhecidos = np.asarray(
-        [1.0 if bit == 1 else -1.0 for bit in PREAMBULO + MARCADOR]
-    )
+
+def buscar_inicios(acumulada, amostras_por_bit, conhecidos):
+    """Retem varios picos: um clique forte nao deve encerrar a busca."""
     quantidade_conhecida = len(conhecidos)
-
-    ultimo = len(sinal_filtrado) - quantidade_conhecida * amostras_por_bit - 1
-    if ultimo <= 0:
-        raise ValueError("Nao ha amostras suficientes para sincronizar.")
-
-    def avaliar(candidato):
-        simbolos = integra_simbolos(
-            acumulada, candidato, quantidade_conhecida, amostras_por_bit
-        )
-        if simbolos is None:
-            return None
-        produtos = simbolos * conhecidos
-
-        # Soma a correlacao em blocos curtos e depois combina os modulos. Isso
-        # tolera uma lenta rotacao de fase, mas rejeita um tom continuo: no tom
-        # sem dados, os sinais +1/-1 conhecidos se cancelam dentro dos blocos.
-        tamanho_bloco = 8
-        somas = [
-            np.sum(produtos[i:i + tamanho_bloco])
-            for i in range(0, quantidade_conhecida, tamanho_bloco)
-        ]
-        metrica = np.sum(np.abs(somas)) / (
-            np.sum(np.abs(simbolos)) + 1e-15
-        )
-        correlacao = np.sum(produtos)
-        energia = float(np.mean(np.abs(simbolos)))
-        return float(metrica), energia, correlacao
-
-    # Busca grosseira em toda a gravacao. Isso evita que um clique ou uma voz
-    # antes da mensagem seja confundido com o inicio do quadro.
+    ultimo = len(acumulada) - 1 - quantidade_conhecida * amostras_por_bit
+    if ultimo < 0:
+        return []
     passo = max(1, amostras_por_bit // 8)
-    candidatos = []
-    for candidato in range(0, ultimo + 1, passo):
-        avaliacao = avaliar(candidato)
-        if avaliacao is not None:
-            metrica, energia, correlacao = avaliacao
-            candidatos.append((candidato, metrica, energia, correlacao))
+    inicios = np.arange(0, ultimo + 1, passo)
 
-    if not candidatos:
-        raise ValueError("Nao foi possivel procurar o preambulo.")
+    def avaliar(posicoes):
+        indices = posicoes[:, None] + np.arange(quantidade_conhecida) * amostras_por_bit
+        simbolos = acumulada[indices + amostras_por_bit] - acumulada[indices]
+        produtos = simbolos * conhecidos
+        blocos = produtos.reshape(len(posicoes), -1, 8).sum(axis=2)
+        energia = np.mean(abs(simbolos), axis=1)
+        metrica = np.sum(abs(blocos), axis=1) / (np.sum(abs(simbolos), axis=1) + 1e-15)
+        return metrica, energia
 
-    maior_energia = max(item[2] for item in candidatos) + 1e-15
-    candidatos = [
-        item for item in candidatos
-        if item[2] >= 0.05 * maior_energia
-    ]
+    # Limita a memoria tambem em mensagens longas e com treinamento maior.
+    metricas = np.empty(len(inicios))
+    energias = np.empty(len(inicios))
+    for primeiro in range(0, len(inicios), 1024):
+        trecho = slice(primeiro, primeiro + 1024)
+        metricas[trecho], energias[trecho] = avaliar(inicios[trecho])
+    referencia = max(float(np.percentile(energias, 90)), 1e-12)
+    # Satura o peso da energia: o transitorio do microfone pode ser dezenas
+    # de vezes maior que a mensagem e antes dominava toda a sincronizacao.
+    notas = metricas * np.sqrt(np.minimum(energias / referencia, 1.0))
+    escolhidos = []
+    for indice in np.argsort(notas)[::-1]:
+        inicio = int(inicios[indice])
+        if notas[indice] < 0.40:
+            break
+        if any(abs(inicio - outro) < amostras_por_bit for outro in escolhidos):
+            continue
+        vizinhos = np.arange(max(0, inicio - passo), min(ultimo, inicio + passo) + 1)
+        m, e = avaliar(vizinhos)
+        nota = m * np.sqrt(np.minimum(e / referencia, 1.0))
+        escolhidos.append(int(vizinhos[np.argmax(nota)]))
+        if len(escolhidos) == 12:
+            break
+    return escolhidos
 
-    def pontuacao(item):
-        return item[1] * np.sqrt(item[2] / maior_energia)
 
-    grosseiro = max(candidatos, key=pontuacao)
+def estimar_portadora(simbolos, conhecidos):
+    """Estima fase e frequencia sem deixar um pico de amplitude dominar."""
+    produtos = simbolos * conhecidos
+    produtos /= np.maximum(abs(produtos), np.median(abs(produtos)) * 0.5 + 1e-15)
+    indices = np.arange(len(produtos))
 
-    # Refina amostra por amostra ao redor do melhor ponto grosseiro.
-    refinados = []
-    primeiro = max(0, grosseiro[0] - passo)
-    final = min(ultimo, grosseiro[0] + passo)
-    for candidato in range(primeiro, final + 1):
-        avaliacao = avaliar(candidato)
-        if avaliacao is not None:
-            metrica, energia, correlacao = avaliacao
-            refinados.append((candidato, metrica, energia, correlacao))
+    def procurar(derivas):
+        correlacoes = np.exp(-1j * derivas[:, None] * indices) @ produtos
+        melhor = int(np.argmax(abs(correlacoes)))
+        return float(derivas[melhor]), correlacoes[melhor]
 
-    melhor_inicio, _, _, _ = max(refinados, key=pontuacao)
-    simbolos_conhecidos = integra_simbolos(
-        acumulada, melhor_inicio, quantidade_conhecida, amostras_por_bit
-    )
+    deriva, _ = procurar(np.linspace(-0.8, 0.8, 321))
+    # A antiga grade de 0,0025 rad/bit acumulava erro em mensagens longas.
+    deriva, correlacao = procurar(np.linspace(deriva - 0.005, deriva + 0.005, 201))
+    metrica = float(abs(correlacao) / (sum(abs(produtos)) + 1e-15))
+    return float(np.angle(correlacao)), deriva, metrica
 
-    # Procura uma pequena rotacao de fase por simbolo. Ela representa a
-    # diferenca entre os relogios das duas placas de som.
-    indices = np.arange(quantidade_conhecida)
-    melhor_metrica = -1.0
-    melhor_correlacao = None
-    melhor_deriva = 0.0
-    for deriva in np.linspace(-0.20, 0.20, 161):
-        compensacao = np.exp(-1j * deriva * indices)
-        correlacao = np.sum(
-            simbolos_conhecidos * conhecidos * compensacao
-        )
-        metrica = np.abs(correlacao) / (
-            np.sum(np.abs(simbolos_conhecidos)) + 1e-15
-        )
-        if metrica > melhor_metrica:
-            melhor_metrica = float(metrica)
-            melhor_correlacao = correlacao
-            melhor_deriva = float(deriva)
 
-    if melhor_metrica < 0.28:
-        raise ValueError(
-            "Sincronizacao fraca mesmo apos procurar toda a gravacao. "
-            "Confirme o microfone, a taxa e a portadora."
-        )
+def decidir_bits(simbolos, fase, deriva, treinamento, taxa_fisica=100):
+    """Acompanha pequenas mudancas de fase durante os dados (BPSK)."""
+    indices = np.arange(len(simbolos))
+    corrigidos = simbolos * np.exp(-1j * (fase + deriva * indices))
+    fase_residual = 0.0
+    velocidade = 0.0
+    piso = np.median(abs(simbolos[:treinamento])) * 0.1
+    escala_tempo = 100 / taxa_fisica
+    for i in range(treinamento, len(corrigidos)):
+        valor = corrigidos[i] * np.exp(-1j * fase_residual)
+        corrigidos[i] = valor
+        erro = float(np.angle(valor * (1 if valor.real >= 0 else -1)))
+        if abs(valor) > piso:
+            velocidade += 0.0008 * escala_tempo ** 2 * erro
+            fase_residual += 0.08 * escala_tempo * erro
+        fase_residual += velocidade
+    return (corrigidos.real >= 0).astype(int).tolist()
 
-    fase = float(np.angle(melhor_correlacao))
-    return (
-        melhor_inicio, fase, melhor_deriva, melhor_metrica, acumulada
-    )
+
+def equalizar_simbolos(acumulada, inicio, amostras_por_bit, conhecidos, tamanho_preambulo,
+                      taps=13, deriva=0.0):
+    """FIR complexo treinado: compensa ecos que misturam bits vizinhos.
+
+    Duas amostras por bit toleram atrasos fracionarios do canal. Ignoramos a
+    primeira metade do preambulo, afetada pelo transitorio do microfone.
+    A validacao leave-one-out avalia cada bit SEM usa-lo no proprio ajuste.
+    """
+    if amostras_por_bit < 2:
+        return None
+    quantidade = (len(acumulada) - 1 - inicio) // amostras_por_bit
+    if quantidade < len(conhecidos):
+        return None
+    # Alterna os comprimentos quando ha um numero impar de amostras por bit,
+    # sem acumular um erro de meia amostra a cada simbolo.
+    indices = inicio + np.arange(quantidade * 2 + 1) * amostras_por_bit // 2
+    z = (acumulada[indices[1:]] - acumulada[indices[:-1]]) / np.diff(indices)
+    z *= np.exp(-1j * deriva * np.arange(len(z)) / 2)
+    posicoes = np.arange(quantidade) * 2
+    X = np.array([
+        z[np.clip(posicoes + i - taps // 2, 0, len(z) - 1)]
+        for i in range(taps)
+    ]).T
+    descarte = tamanho_preambulo // 2
+    X /= max(float(np.sqrt(np.mean(abs(X[descarte:len(conhecidos)]) ** 2))), 1e-12)
+    treino = X[descarte:len(conhecidos)]
+    alvo = conhecidos[descarte:]
+    inversa = np.linalg.inv(treino.conj().T @ treino + 0.1 * np.eye(taps))
+    coeficientes = inversa @ treino.conj().T @ alvo
+    previstos = treino @ coeficientes
+    influencia = np.real(np.sum((treino @ inversa) * treino.conj(), axis=1))
+    validacao = (previstos - influencia * alvo) / np.maximum(1 - influencia, 1e-9)
+    corretos = validacao.real * alvo > 0
+    separacao = tamanho_preambulo - descarte
+    if np.mean(corretos[:separacao]) < 0.8 or np.mean(corretos[separacao:]) < 0.75:
+        return None
+    metrica = float(np.mean(np.clip(validacao.real * alvo, -1, 1)))
+    if metrica < 0.4:
+        return None
+    return X @ coeficientes, metrica
 
 
 def demodular_bpsk(sinal, taxa_bits, portadora):
-    """Recupera a mensagem usando uma portadora local e decisao pelo sinal."""
-    inicio, fase, deriva, metrica, acumulada = sincronizar(
-        sinal, taxa_bits, portadora
-    )
+    """Recebe taxa UTIL e reconhece tambem as gravacoes das versoes antigas."""
+    validar_parametros(taxa_bits, portadora)
+    tentativas = [
+        (calcular_taxa_fisica(taxa_bits), ["atual"]),
+        # Nas versoes anteriores, o parametro do menu era a taxa fisica.
+        (taxa_bits, ["anterior", "antigo"]),
+    ]
+    erros = []
+    for taxa_fisica, formatos in tentativas:
+        try:
+            return demodular_na_taxa_fisica(sinal, taxa_fisica, portadora, formatos)
+        except ValueError as erro:
+            erros.append(str(erro))
+    raise ValueError(erros[0])
+
+
+def demodular_na_taxa_fisica(sinal, taxa_bits, portadora, formatos):
+    """So aceita sincronizacao depois de validar marcador, tamanho e checksum."""
+    validar_taxa_fisica(taxa_bits, portadora)
+    sinal = np.asarray(sinal, dtype=np.float64)
+    if sinal.ndim != 1 or not len(sinal) or not np.all(np.isfinite(sinal)):
+        raise ValueError("A gravacao precisa conter amostras mono validas.")
     amostras_por_bit = TAXA_AMOSTRAGEM // taxa_bits
-    quantidade = (len(sinal) - inicio) // amostras_por_bit
-    simbolos = integra_simbolos(
-        acumulada, inicio, quantidade, amostras_por_bit
+    if len(sinal) < 48 * amostras_por_bit:
+        raise ValueError("Nao ha amostras suficientes para sincronizar.")
+    acumulada = preparar_recepcao(sinal, taxa_bits, portadora)
+    tentativas_equalizacao = []
+    melhor_erro = None
+
+    def validar(bits, formato, inicio, fase, deriva, metrica, modo):
+        nonlocal melhor_erro
+        preambulo, marcador, repeticoes = parametros_quadro(formato)
+        if modo == "coerente" and np.mean(np.array(bits[:len(preambulo)]) == preambulo) < 0.8:
+            return None
+        try:
+            texto, usados = interpretar_quadro(bits, formato)
+        except ValueError as erro:
+            if melhor_erro is None and "Marcador nao encontrado" not in str(erro):
+                melhor_erro = str(erro)
+            return None
+        if modo == "equalizado" and repeticoes > 1:
+            dados = np.array(bits[len(preambulo) + len(marcador):usados]).reshape(-1, repeticoes)
+            maiorias = np.sum(dados, axis=1) > repeticoes // 2
+            if np.mean(dados == maiorias[:, None]) < 0.9:
+                return None
+        diagnostico = {
+            "inicio_amostra": int(inicio),
+            "fase_graus": float(np.degrees(fase)) if modo == "coerente" else None,
+            "deriva_hz": float(deriva * taxa_bits / (2 * np.pi)),
+            "metrica_sincronizacao": float(metrica), "bits_decodificados": usados,
+            "formato": formato, "modo": modo, "checksum_valido": True,
+            "taxa_fisica_bps": taxa_bits,
+            "taxa_util_bps": taxa_bits / repeticoes,
+            "repeticoes": repeticoes,
+        }
+        return texto, bits, diagnostico
+
+    for formato in formatos:
+        preambulo, marcador, _ = parametros_quadro(formato)
+        conhecidos = np.array(preambulo + marcador) * 2.0 - 1
+        candidatos = buscar_inicios(acumulada, amostras_por_bit, conhecidos)
+        for inicio in candidatos:
+            quantidade = (len(sinal) - inicio) // amostras_por_bit
+            simbolos = integra_simbolos(acumulada, inicio, quantidade, amostras_por_bit)
+            fase, deriva, metrica = estimar_portadora(simbolos[:len(conhecidos)], conhecidos)
+            if metrica >= 0.55:
+                bits = decidir_bits(simbolos, fase, deriva, len(conhecidos), taxa_bits)
+                resultado = validar(bits, formato, inicio, fase, deriva, metrica, "coerente")
+                if resultado is not None:
+                    return resultado
+            tentativas_equalizacao.append((formato, inicio, conhecidos, deriva))
+
+    # So recorre ao equalizador quando a recepcao coerente simples falhou.
+    # Cada alinhamento precisa passar validacao independente e checksum;
+    # nao basta ajustar o marcador conhecido e declarar sincronizacao.
+    for formato, centro, conhecidos, deriva in tentativas_equalizacao:
+        preambulo, _, _ = parametros_quadro(formato)
+        passo = max(1, amostras_por_bit // 16)
+        for deslocamento in range(-amostras_por_bit // 2, amostras_por_bit // 2 + 1, passo):
+            inicio = centro + deslocamento
+            if inicio < 0:
+                continue
+            # Mantem aproximadamente o mesmo alcance em segundos dos filtros
+            # que recuperaram a gravacao da sala (13 taps em 100 bits/s).
+            tamanhos = [min(61, 2 * round(6 * taxa_bits / 100) + 1),
+                        max(5, 2 * round(2 * taxa_bits / 100) + 1)]
+            for taps in (tamanhos if formato != "antigo" else [5]):
+                for compensacao in [0.0, deriva]:
+                    ajuste = equalizar_simbolos(acumulada, inicio, amostras_por_bit,
+                                                conhecidos, len(preambulo), taps, compensacao)
+                    if ajuste is None:
+                        continue
+                    simbolos, metrica = ajuste
+                    bits = decidir_bits(simbolos, 0.0, 0.0, len(conhecidos), taxa_bits)
+                    resultado = validar(bits, formato, inicio, 0.0, compensacao, metrica, "equalizado")
+                    if resultado is not None:
+                        return resultado
+    if melhor_erro:
+        raise ValueError(melhor_erro)
+    raise ValueError(
+        "Sincronizacao fraca ou marcador nao encontrado: nenhum quadro passou "
+        "na validacao. Confira a taxa, a portadora e o microfone; "
+        "desative supressao de ruido e melhorias de voz na entrada de audio."
     )
-    if simbolos is None:
-        raise ValueError("Falha ao dividir a gravacao em bits.")
-
-    # Corrige tanto a fase inicial quanto sua lenta variacao ao longo do audio.
-    fases = fase + deriva * np.arange(len(simbolos))
-    corrigidos = simbolos * np.exp(-1j * fases)
-    bits = (np.real(corrigidos) >= 0).astype(int).tolist()
-    texto, bits_utilizados = interpretar_quadro(bits)
-
-    diagnostico = {
-        "inicio_amostra": inicio,
-        "fase_graus": np.degrees(fase),
-        "deriva_hz": deriva * taxa_bits / (2 * np.pi),
-        "metrica_sincronizacao": metrica,
-        "bits_decodificados": bits_utilizados,
-    }
-    return texto, bits, diagnostico
 
 
 # ---------------------------------------------------------------------------
@@ -515,22 +649,26 @@ def calcular_fft_db(sinal):
 
 
 def banda_teorica(taxa_bits, portadora):
-    """Em BPSK retangular, o lobulo principal vai de fc-Rb ate fc+Rb."""
-    return portadora - taxa_bits, portadora + taxa_bits
+    """Lobulo principal dos pulsos fisicos retangulares (taxa recebida UTIL)."""
+    taxa_fisica = calcular_taxa_fisica(taxa_bits)
+    return portadora - taxa_fisica, portadora + taxa_fisica
 
 
-def plotar_fft(sinal, titulo, caminho, taxa_bits, portadora, mostrar=True):
+def plotar_fft(sinal, titulo, caminho, taxa_bits, portadora, mostrar=True, taxa_fisica=None):
     plt = obter_matplotlib()
     frequencias, db = calcular_fft_db(sinal)
-    inferior, superior = banda_teorica(taxa_bits, portadora)
+    if taxa_fisica is None:
+        taxa_fisica = calcular_taxa_fisica(taxa_bits)
+    inferior, superior = portadora - taxa_fisica, portadora + taxa_fisica
 
     figura, eixo = plt.subplots(figsize=(11, 5), constrained_layout=True)
     eixo.plot(frequencias, db, linewidth=0.8)
     eixo.axvline(portadora, color="black", linestyle=":",
                  label=f"portadora = {portadora} Hz")
     eixo.axvspan(inferior, superior, color="green", alpha=0.15,
-                 label=f"lobulo principal ≈ {2 * taxa_bits} Hz")
-    eixo.set_xlim(max(0, portadora - 1_000), portadora + 1_000)
+                 label=f"lobulo principal ≈ {2 * taxa_fisica} Hz")
+    largura_exibida = max(1_000, 1.5 * taxa_fisica)
+    eixo.set_xlim(max(0, portadora - largura_exibida), portadora + largura_exibida)
     eixo.set_ylim(-100, 5)
     eixo.set_title(titulo)
     eixo.set_xlabel("Frequencia (Hz)")
@@ -553,9 +691,10 @@ def comparar_taxas(texto="TESTE DE TAXA PSK"):
     for taxa in [50, 100, 200]:
         sinal, _ = criar_audio_da_mensagem(texto, taxa, portadora)
         f, db = calcular_fft_db(sinal)
-        mascara = (f >= portadora - 700) & (f <= portadora + 700)
+        mascara = (f >= portadora - 1_200) & (f <= portadora + 1_200)
+        fisica = calcular_taxa_fisica(taxa)
         eixo.plot(f[mascara], db[mascara], linewidth=0.9,
-                  label=f"{taxa} bits/s - banda principal ≈ {2*taxa} Hz")
+                  label=f"{taxa} uteis/s | {fisica} fisicos/s | banda ≈ {2*fisica} Hz")
 
     eixo.axvline(portadora, color="black", linestyle=":")
     eixo.set_title("Efeito da taxa de bits na FFT BPSK")
@@ -599,7 +738,8 @@ def comparar_portadoras(texto="TESTE DE PORTADORA PSK"):
 # ---------------------------------------------------------------------------
 
 def imprimir_diagnostico_emissao(texto, bits, sinal, taxa_bits, portadora):
-    duracao_bits = len(bits) / taxa_bits
+    taxa_fisica = calcular_taxa_fisica(taxa_bits)
+    duracao_bits = len(bits) / taxa_fisica
     inferior, superior = banda_teorica(taxa_bits, portadora)
     dados = texto.encode("utf-8")
 
@@ -608,14 +748,16 @@ def imprimir_diagnostico_emissao(texto, bits, sinal, taxa_bits, portadora):
     print(f"Bytes UTF-8: {list(dados)}")
     print(f"Primeiros bits: {''.join(map(str, bits[:96]))}")
     print(f"Total do quadro: {len(bits)} bits")
-    print(f"Taxa: {taxa_bits} bits/s")
+    print(f"Taxa util dos caracteres: {taxa_bits} bits/s")
+    print(f"Taxa fisica BPSK: {taxa_fisica} bits/s (repeticao {REPETICOES}x)")
+    print(f"Duracao apenas dos caracteres: {len(dados) * 8 / taxa_bits:.3f} s")
     print(f"Duracao dos bits: {duracao_bits:.3f} s")
     print(f"Duracao total com silencios: {len(sinal)/TAXA_AMOSTRAGEM:.3f} s")
-    print(f"Amostras por bit: {TAXA_AMOSTRAGEM // taxa_bits}")
+    print(f"Amostras por bit fisico: {TAXA_AMOSTRAGEM // taxa_fisica}")
     print(f"Portadora: {portadora} Hz")
     print(
         f"Lobulo principal: {inferior} a {superior} Hz "
-        f"(largura aproximada de {2 * taxa_bits} Hz)"
+        f"(largura aproximada de {2 * taxa_fisica} Hz)"
     )
 
 
@@ -650,21 +792,56 @@ def receber(taxa_bits, portadora):
     )
     sinal = gravar(duracao)
     salvar_wav(ARQUIVO_RECEBIDO, sinal)
-    texto, bits, diagnostico = demodular_bpsk(
-        sinal, taxa_bits, portadora
-    )
-    plotar_fft(
-        sinal,
-        "FFT do sinal BPSK recebido",
-        PASTA_GRAFICOS / "02_fft_recebido.png",
-        taxa_bits,
-        portadora,
-        mostrar=False,
-    )
+    # Guarda cada tentativa: antes o proximo teste apagava a gravacao anterior.
+    pasta = PASTA_RESULTADOS / "capturas" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    pasta.mkdir(parents=True, exist_ok=False)
+    salvar_wav(pasta / "audio_recebido.wav", sinal)
+    relatorio = {
+        "taxa_util_configurada_bps": taxa_bits,
+        "taxa_fisica_configurada_bps": calcular_taxa_fisica(taxa_bits),
+        "portadora_hz": portadora,
+        "taxa_amostragem": TAXA_AMOSTRAGEM, "duracao_s": len(sinal) / TAXA_AMOSTRAGEM,
+    }
+    try:
+        # A FFT precisa ser atualizada mesmo quando a decodificacao falhar.
+        # Antes ela ficava com o grafico de uma tentativa antiga.
+        plotar_fft(sinal, "FFT do sinal BPSK recebido", pasta / "fft_recebido.png",
+                   taxa_bits, portadora, mostrar=False)
+        (PASTA_GRAFICOS / "02_fft_recebido.png").write_bytes(
+            (pasta / "fft_recebido.png").read_bytes()
+        )
+        texto, bits, diagnostico = demodular_bpsk(sinal, taxa_bits, portadora)
+        if diagnostico["taxa_fisica_bps"] != calcular_taxa_fisica(taxa_bits):
+            plotar_fft(sinal, "FFT do sinal BPSK recebido", pasta / "fft_recebido.png",
+                       taxa_bits, portadora, mostrar=False,
+                       taxa_fisica=diagnostico["taxa_fisica_bps"])
+            (PASTA_GRAFICOS / "02_fft_recebido.png").write_bytes(
+                (pasta / "fft_recebido.png").read_bytes()
+            )
+        relatorio.update(sucesso=True, diagnostico=diagnostico)
+    except (ValueError, RuntimeError) as erro:
+        relatorio.update(sucesso=False, erro=str(erro))
+        raise
+    finally:
+        (pasta / "diagnostico.json").write_text(
+            json.dumps(relatorio, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"Gravacao e diagnostico preservados em {pasta}")
+    imprimir_recepcao(texto, bits, diagnostico)
+
+
+def imprimir_recepcao(texto, bits, diagnostico):
 
     print("\n--- DIAGNOSTICO DO RECEPTOR ---")
+    print(f"Formato reconhecido: {diagnostico['formato']}")
+    print(f"Recepcao: {diagnostico['modo']}; checksum correto")
+    print(f"Taxa util detectada: {diagnostico['taxa_util_bps']:g} bits/s")
+    print(f"Taxa fisica detectada: {diagnostico['taxa_fisica_bps']:g} bits/s")
     print(f"Inicio detectado na amostra: {diagnostico['inicio_amostra']}")
-    print(f"Fase estimada: {diagnostico['fase_graus']:.2f} graus")
+    if diagnostico["fase_graus"] is None:
+        print("Fase compensada pelos coeficientes do equalizador")
+    else:
+        print(f"Fase estimada: {diagnostico['fase_graus']:.2f} graus")
     print(
         "Diferenca estimada de frequencia: "
         f"{diagnostico['deriva_hz']:.3f} Hz"
@@ -677,7 +854,14 @@ def receber(taxa_bits, portadora):
     print("\n" + "=" * 62)
     print(f"MENSAGEM RECEBIDA: {texto}")
     print("=" * 62)
-    print(f"FFT salva em {PASTA_GRAFICOS / '02_fft_recebido.png'}")
+
+
+def decodificar_arquivo(caminho, taxa_bits, portadora):
+    """Reprocessa gravacoes sem microfone e sem sobrescrever os resultados."""
+    sinal = carregar_wav(caminho)
+    resultado = demodular_bpsk(sinal, taxa_bits, portadora)
+    imprimir_recepcao(*resultado)
+    return resultado
 
 
 def teste_local(taxa_bits, portadora):
@@ -693,10 +877,7 @@ def teste_local(taxa_bits, portadora):
     )
     print("\nTeste local concluido sem usar microfone.")
     print(f"Mensagem recuperada: {texto}")
-    print(
-        f"Sincronizacao: {diagnostico['metrica_sincronizacao']:.3f}; "
-        f"fase: {diagnostico['fase_graus']:.2f} graus"
-    )
+    print(f"Sincronizacao: {diagnostico['metrica_sincronizacao']:.3f}; modo: {diagnostico['modo']}")
     print(f"Bits lidos: {len(bits)}")
 
 
@@ -713,15 +894,17 @@ def menu():
     while True:
         print("\n" + "=" * 66)
         print("PROJETO 8 - PARTE 2 - CHAT BPSK")
-        print(f"Configuracao: {taxa_bits} bits/s | portadora {portadora} Hz")
+        print(f"Configuracao: {taxa_bits} bits uteis/s | "
+              f"{calcular_taxa_fisica(taxa_bits)} fisicos/s | portadora {portadora} Hz")
         print("=" * 66)
         print("1 - EMISSOR: digitar e transmitir uma mensagem")
         print("2 - RECEPTOR: gravar e decodificar uma mensagem")
         print("3 - Teste local do ultimo audio (sem microfone)")
-        print("4 - Comparar taxas de 50, 100 e 200 bits/s")
+        print("4 - Comparar taxas de 50, 100 e 200 bits UTEIS/s")
         print("5 - Comparar portadoras de 2,5, 4 e 5,5 kHz")
         print("6 - Alterar taxa de bits e portadora")
         print("7 - Mostrar FFT emitida e recebida")
+        print("8 - Decodificar o ultimo audio recebido (sem gravar novamente)")
         print("0 - Sair")
 
         escolha = input("Escolha: ").strip()
@@ -738,7 +921,7 @@ def menu():
                 comparar_portadoras()
             elif escolha == "6":
                 nova_taxa = ler_inteiro_opcional(
-                    "Nova taxa em bits/s", taxa_bits
+                    "Nova taxa UTIL em bits/s", taxa_bits
                 )
                 nova_portadora = ler_inteiro_opcional(
                     "Nova portadora em Hz", portadora
@@ -767,6 +950,8 @@ def menu():
                     eixo.axis("off")
                     eixo.set_title(arquivo.stem)
                 plt.show()
+            elif escolha == "8":
+                decodificar_arquivo(ARQUIVO_RECEBIDO, taxa_bits, portadora)
             elif escolha == "0":
                 print("Programa encerrado.")
                 break
@@ -776,5 +961,21 @@ def menu():
             print(f"\nERRO: {erro}")
 
 
+def executar():
+    parser = argparse.ArgumentParser(description="Chat BPSK por audio")
+    parser.add_argument("--decodificar", type=Path, help="WAV recebido para reprocessar sem microfone")
+    parser.add_argument("--taxa", type=int, default=TAXA_BITS_PADRAO,
+                        help="Bits UTEIS/s; novos quadros usam 3x fisicos/s (padrao: 100)")
+    parser.add_argument("--portadora", type=int, default=PORTADORA_PADRAO, help="Portadora em Hz (padrao: 4000)")
+    args = parser.parse_args()
+    if args.decodificar:
+        try:
+            decodificar_arquivo(args.decodificar, args.taxa, args.portadora)
+        except (OSError, RuntimeError, ValueError, wave.Error) as erro:
+            parser.exit(1, f"ERRO: {erro}\n")
+    else:
+        menu()
+
+
 if __name__ == "__main__":
-    menu()
+    executar()
