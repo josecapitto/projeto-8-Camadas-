@@ -1,0 +1,9 @@
+{
+  "taxa_util_configurada_bps": 100,
+  "taxa_fisica_configurada_bps": 300,
+  "portadora_hz": 4000,
+  "taxa_amostragem": 48000,
+  "duracao_s": 5.0,
+  "sucesso": false,
+  "erro": "Sincronizacao fraca ou marcador nao encontrado: nenhum quadro passou na validacao. Confira a taxa, a portadora e o microfone; desative supressao de ruido e melhorias de voz na entrada de audio."
+}

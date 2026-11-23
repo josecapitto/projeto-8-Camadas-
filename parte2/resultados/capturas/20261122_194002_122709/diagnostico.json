@@ -1,0 +1,21 @@
+{
+  "taxa_util_configurada_bps": 100,
+  "taxa_fisica_configurada_bps": 300,
+  "portadora_hz": 4000,
+  "taxa_amostragem": 48000,
+  "duracao_s": 7.0,
+  "sucesso": true,
+  "diagnostico": {
+    "inicio_amostra": 145133,
+    "fase_graus": null,
+    "deriva_hz": 0.0,
+    "metrica_sincronizacao": 0.7919598842241675,
+    "bits_decodificados": 504,
+    "formato": "atual",
+    "modo": "equalizado",
+    "checksum_valido": true,
+    "taxa_fisica_bps": 300,
+    "taxa_util_bps": 100.0,
+    "repeticoes": 3
+  }
+}

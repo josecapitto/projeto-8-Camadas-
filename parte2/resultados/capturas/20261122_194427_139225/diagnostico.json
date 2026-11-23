@@ -1,0 +1,9 @@
+{
+  "taxa_util_configurada_bps": 100,
+  "taxa_fisica_configurada_bps": 300,
+  "portadora_hz": 4000,
+  "taxa_amostragem": 48000,
+  "duracao_s": 7.0,
+  "sucesso": false,
+  "erro": "Checksum incorreto: algum bit foi recebido errado. Aproxime o microfone, ajuste o volume ou reduza o ruido."
+}
